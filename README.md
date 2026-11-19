@@ -184,9 +184,28 @@ This produces `SteamSnitcher.exe` next to the script. All the code is in one fil
 - **It uses Steam's Web API endpoints** that power the Steam client and website. They work today but aren't officially documented for third parties, so Valve could change them. If that happens, the app logs the error and keeps trying, and an update would be needed.
 - Owner names depend on the Steam desktop client's local friend cache. If the Steam client isn't installed on the PC, you'll see account numbers instead of names.
 
-## Disclaimer
+## Is this allowed? Safety, privacy and disclaimer
 
-Steam Snitcher is a fan-made tool. It isn't affiliated with, endorsed by or sponsored by Valve. Steam and the Steam logo are trademarks of Valve Corporation. Game capsule images are loaded from Steam's public CDN at runtime and aren't included in this repository, except in the screenshots.
+**What the app does and doesn't do**
+
+- **It only reads what Steam already shows you.** Your family's shared library, who owns each game and your own wishlist are all visible to you in the Steam client and on the Steam website. Steam Snitcher asks Steam for the same information, through the same web endpoints the Steam client and website use, and shows it in a more convenient way. It doesn't see anything you couldn't already see yourself.
+- **It doesn't modify Steam.** It doesn't inject anything into the Steam client, doesn't touch game files, doesn't automate purchases, trades, chat, the market or gameplay, and doesn't get around any Steam restriction. It's a separate app that reads data.
+- **It's light on Steam's servers.** It makes a handful of requests every 2 hours.
+- **No password, ever.** You sign in with Steam's own QR code flow, approved in the official Steam mobile app.
+
+**Where your data goes**
+
+- **To Steam, and nowhere else.** The app talks only to `api.steampowered.com` and `store.steampowered.com` (your data) and to Steam's image CDN (the capsule art). There is no server of mine, no analytics and no telemetry.
+- **Everything is stored locally** in `%LOCALAPPDATA%\SteamSnitcher` on your PC: the library snapshot, the last copy of your wishlist, the log and the connection token. Nothing is uploaded or synced to any cloud.
+- **Names come from your own PC.** Owner names are read from the friend cache the Steam client already keeps on your disk.
+
+**Be aware of**
+
+- **The connection token is a real Steam sign-in.** It works like a logged-in Steam mobile session. It's encrypted with Windows DPAPI, so it can't be read from another PC or another Windows user. But any program running as *your* Windows user could in principle use it, exactly as it could use your browser's Steam cookies. If you ever suspect malware, remove **"PC - Steam Snitcher"** under **Steam → Account details → Authorized devices** and the token stops working right away.
+- **Steam's rules.** As far as I can tell, nothing in how the app works conflicts with the [Steam Subscriber Agreement](https://store.steampowered.com/subscriber_agreement/): it doesn't modify the client, doesn't cheat and doesn't automate anything on your account, and similar community tools have read account data through these endpoints for years. Still, I'm not a lawyer, and Valve hasn't officially documented these endpoints for third parties, so they could change or restrict them at any time. Use it at your own risk.
+- **Privacy within the family.** The app tells you who bought what. Your family members can already see this in Steam, but the app makes it much more visible. Use it as a convenience, not to police anyone.
+
+**Disclaimer:** Steam Snitcher is a fan-made tool. It isn't affiliated with, endorsed by or sponsored by Valve. Steam and the Steam logo are trademarks of Valve Corporation. Game capsule images are loaded from Steam's public CDN at runtime and aren't included in this repository, except in the screenshots. The software is provided "as is", without warranty (see the [license](LICENSE)).
 
 ## License
 
