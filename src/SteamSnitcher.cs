@@ -1,19 +1,23 @@
 ﻿// Steam Snitcher: confere a biblioteca Steam (com a Familia Steam) a cada 2 horas
 // e mostra um aviso fixo quando aparece jogo novo, dizendo quem comprou
 // (e avisando quando foi um jogo da sua lista de desejos).
-// Login: QR code aprovado no app Steam do celular (nunca pede senha).
+// Login: no site oficial da Steam, numa janela de navegador (WebView2) dentro do app.
+// O app nao ve a senha e nao se apresenta como outro aparelho: usa o codigo de acesso que o
+// proprio site da Steam da ao navegador (a primeira versao usava QR "de celular" e a Steam
+// travou a conta por "dispositivo inesperado").
 // Compilar: build.cmd (usa o csc.exe que ja vem no Windows, .NET Framework 4).
 using System;
 using System.Collections.Generic;
-using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -33,11 +37,27 @@ static class Programa
     {
         SetProcessDPIAware();
         ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-        if (args.Contains("--demo")) { Application.EnableVisualStyles(); Demo.Rodar(args.Length > 1 ? args[1] : null); return 0; } // dados falsos, nao instala nada
+        if (args.Contains("--demo")) { Dlls.Preparar(); Application.EnableVisualStyles(); Demo.Rodar(args.Length > 1 ? args[1] : null); return 0; } // dados falsos, nao instala nada
         MigrarVersaoAntiga();
         Directory.CreateDirectory(PastaDados);
-        if (args.Length == 2 && args[0] == "--qr-png") { Qr.Bitmap(args[1], 8).Save(Path.Combine(PastaDados, "qr_teste.png")); return 0; }
+        Dlls.Preparar();
+        ApagarConexaoQr();
         if (args.Contains("--teste-aviso")) { Base.TirarUmParaTeste(); Sinal("Conferir"); return 0; }
+        if (args.Contains("--teste-sessao")) // so tenta renovar o codigo, escondido, e anota o resultado no registro
+        {
+            Application.EnableVisualStyles();
+            var ctx = new ApplicationContext();
+            var t = new System.Windows.Forms.Timer { Interval = 100 };
+            t.Tick += delegate
+            {
+                t.Stop();
+                Sessao.ObterToken(tk => { Log("teste-sessao: codigo obtido, vence " + Steam.VenceToken(tk).ToLocalTime()); ctx.ExitThread(); },
+                                  (erro, entrar) => { Log("teste-sessao: " + erro + " | precisa entrar=" + entrar); ctx.ExitThread(); });
+            };
+            t.Start();
+            Application.Run(ctx);
+            return 0;
+        }
 
         bool instalado = string.Equals(Path.GetFullPath(Application.ExecutablePath), ExeInstalado, StringComparison.OrdinalIgnoreCase);
         bool primeira;
@@ -61,6 +81,18 @@ static class Programa
     {
         EventWaitHandle e;
         if (EventWaitHandle.TryOpenExisting("SteamSnitcher_" + nome, out e)) e.Set();
+    }
+
+    // A versao 1.0 entrava por QR fingindo ser o app de celular e a Steam travava a conta: apaga essa conexao.
+    static void ApagarConexaoQr()
+    {
+        string velho = Path.Combine(PastaDados, "conexao.dat");
+        if (!File.Exists(velho)) return;
+        File.Delete(velho);
+        Log("Conexao antiga por QR apagada.");
+        MessageBox.Show(L.T("Esta versão não usa mais o login por QR, que fazia a Steam desconfiar da conta.\n\nA conexão antiga foi apagada. Por segurança, remova também \"PC - Steam Snitcher\" em Steam > Detalhes da conta > Dispositivos autorizados.",
+                            "This version no longer uses the QR sign-in, which made Steam flag accounts.\n\nThe old connection was deleted. To be safe, also remove \"PC - Steam Snitcher\" under Steam > Account details > Authorized devices."),
+            Nome, MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     // A primeira versao se chamava "Monitor da Biblioteca Steam": fecha ela, leva os dados e tira o inicio automatico dela.
@@ -131,8 +163,8 @@ static class L
 // ---------------- Steam (Web API oficial) ----------------
 class SteamErro : Exception
 {
-    public bool PrecisaQr;
-    public SteamErro(string m, bool precisaQr) : base(m) { PrecisaQr = precisaQr; }
+    public bool PrecisaEntrar;
+    public SteamErro(string m, bool precisaEntrar) : base(m) { PrecisaEntrar = precisaEntrar; }
 }
 
 static class Steam
@@ -145,15 +177,6 @@ static class Steam
         var d = Json.DeserializeObject(texto) as Dictionary<string, object>;
         object r;
         return d != null && d.TryGetValue("response", out r) && r is Dictionary<string, object> ? (Dictionary<string, object>)r : new Dictionary<string, object>();
-    }
-
-    public static Dictionary<string, object> Post(string metodo, NameValueCollection campos)
-    {
-        using (var wc = new WebClient())
-        {
-            wc.Encoding = Encoding.UTF8;
-            return Resposta(Encoding.UTF8.GetString(wc.UploadValues(Api + metodo, campos)));
-        }
     }
 
     public static Dictionary<string, object> Get(string metodo, string query)
@@ -187,53 +210,20 @@ static class Steam
         return Txt(d, "sub");
     }
 
-    // ---- token guardado (criptografado pelo Windows, so abre nesta conta do PC) ----
-    static string ArqToken { get { return Path.Combine(Programa.PastaDados, "conexao.dat"); } }
-
-    public static void GuardarToken(string refresh)
+    // Validade do token (campo "exp" do JWT), em UTC.
+    public static DateTime VenceToken(string jwt)
     {
-        File.WriteAllBytes(ArqToken, ProtectedData.Protect(Encoding.UTF8.GetBytes(refresh), null, DataProtectionScope.CurrentUser));
-    }
-
-    public static string LerToken()
-    {
-        if (!File.Exists(ArqToken)) return null;
-        try { return Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(ArqToken), null, DataProtectionScope.CurrentUser)); }
-        catch { return null; }
-    }
-
-    public static bool Conectado { get { return LerToken() != null; } }
-
-    static string NovoAcesso(out string steamid)
-    {
-        string refresh = LerToken();
-        if (refresh == null) throw new SteamErro(L.T("Ainda não conectado à Steam.", "Not connected to Steam yet."), true);
-        steamid = SteamIdDoToken(refresh);
-        Dictionary<string, object> r;
-        try
-        {
-            r = Post("IAuthenticationService/GenerateAccessTokenForApp/v1/",
-                new NameValueCollection { { "refresh_token", refresh }, { "steamid", steamid }, { "renewal_type", "1" } });
-        }
-        catch (WebException ex)
-        {
-            var h = ex.Response as HttpWebResponse;
-            if (h != null && (h.StatusCode == HttpStatusCode.Unauthorized || h.StatusCode == HttpStatusCode.Forbidden))
-                throw new SteamErro(L.T("A conexão com a Steam venceu ou foi desligada.", "The Steam connection expired or was removed."), true);
-            throw;
-        }
-        string acesso = Txt(r, "access_token");
-        if (string.IsNullOrEmpty(acesso)) throw new SteamErro(L.T("A conexão com a Steam venceu ou foi desligada.", "The Steam connection expired or was removed."), true);
-        string novoRefresh = Txt(r, "refresh_token");
-        if (!string.IsNullOrEmpty(novoRefresh)) GuardarToken(novoRefresh); // a Steam renova a conexao antes de vencer
-        return acesso;
+        string p = jwt.Split('.')[1].Replace('-', '+').Replace('_', '/');
+        p = p.PadRight(p.Length + (4 - p.Length % 4) % 4, '=');
+        var d = Json.DeserializeObject(Encoding.UTF8.GetString(Convert.FromBase64String(p))) as Dictionary<string, object>;
+        return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(Convert.ToDouble(d["exp"]));
     }
 
     // Lista completa: appid -> (nome, donos). Tambem devolve os appids da sua lista de desejos (vazia se falhar).
-    public static Dictionary<string, Jogo> LerBiblioteca(out HashSet<string> desejos)
+    public static Dictionary<string, Jogo> LerBiblioteca(string token, out HashSet<string> desejos)
     {
-        string eu;
-        string tk = Uri.EscapeDataString(NovoAcesso(out eu));
+        string eu = SteamIdDoToken(token);
+        string tk = Uri.EscapeDataString(token);
         desejos = new HashSet<string>();
         try
         {
@@ -241,7 +231,15 @@ static class Steam
             foreach (var i in Lista(w, "items")) desejos.Add(Txt(i, "appid"));
         }
         catch (Exception ex) { Programa.Log("Nao li a lista de desejos: " + ex.Message); desejos = null; }
-        var fam = Get("IFamilyGroupsService/GetFamilyGroupForUser/v1/", "access_token=" + tk + "&steamid=" + eu + "&include_family_group_response=true");
+        Dictionary<string, object> fam;
+        try { fam = Get("IFamilyGroupsService/GetFamilyGroupForUser/v1/", "access_token=" + tk + "&steamid=" + eu + "&include_family_group_response=true"); }
+        catch (WebException ex)
+        {
+            var h = ex.Response as HttpWebResponse;
+            if (h != null && (h.StatusCode == HttpStatusCode.Unauthorized || h.StatusCode == HttpStatusCode.Forbidden))
+                throw new SteamErro(L.T("A Steam pediu para você entrar de novo.", "Steam asked you to sign in again."), true);
+            throw;
+        }
         string grupo = Txt(fam, "family_groupid");
         if (string.IsNullOrEmpty(grupo) || grupo == "0") throw new SteamErro(L.T("Esta conta não está numa Família Steam.", "This account is not in a Steam Family."), false);
 
@@ -403,7 +401,7 @@ class Bandeja : ApplicationContext
         ui.CreateControl();
         icone.Icon = SystemIcons.Information;
         icone.Text = Programa.Nome;
-        icone.ContextMenuStrip = CriarMenu(MostrarLista, delegate { Conferir(false); }, PedirQr, Sair);
+        icone.ContextMenuStrip = CriarMenu(MostrarLista, delegate { Conferir(false); }, PedirLogin, Desconectar, Sair);
         icone.DoubleClick += delegate { MostrarLista(); };
         icone.Visible = true;
 
@@ -423,7 +421,7 @@ class Bandeja : ApplicationContext
         relogio.Start();
         Programa.Log("Iniciado. Proxima conferencia: " + proxima.ToString("dd/MM HH:mm"));
 
-        if (!Steam.Conectado) { PedirQr(); return; }
+        if (!Sessao.Conectado) { PedirLogin(); return; }
         if (!Base.Existe || recemInstalado) { Conferir(true); return; } // ao instalar mostra o aviso de exemplo
         if (mostrarLista) MostrarLista();
         // ao ligar o PC tambem confere uma vez (pega jogos que entraram com o PC desligado)
@@ -432,12 +430,13 @@ class Bandeja : ApplicationContext
         espera.Start();
     }
 
-    public static ContextMenuStrip CriarMenu(Action lista, Action conferir, Action qr, Action sair)
+    public static ContextMenuStrip CriarMenu(Action lista, Action conferir, Action entrar, Action desconectar, Action sair)
     {
         var menu = new ContextMenuStrip();
         menu.Items.Add(L.T("Ver lista de jogos e donos", "See games and owners"), null, delegate { lista(); });
         menu.Items.Add(L.T("Conferir agora", "Check now"), null, delegate { conferir(); });
-        menu.Items.Add(L.T("Conectar à Steam de novo (QR)", "Reconnect to Steam (QR)"), null, delegate { qr(); });
+        menu.Items.Add(L.T("Entrar na Steam de novo", "Sign in to Steam again"), null, delegate { entrar(); });
+        menu.Items.Add(L.T("Desconectar da Steam", "Disconnect from Steam"), null, delegate { desconectar(); });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(L.T("Sair", "Exit"), null, delegate { sair(); });
         return menu;
@@ -457,12 +456,35 @@ class Bandeja : ApplicationContext
         ouvintes.Add(t);
     }
 
-    void PedirQr()
+    void PedirLogin()
     {
-        foreach (Form f in Application.OpenForms) if (f is JanelaQr) { f.Activate(); return; }
-        var j = new JanelaQr();
+        foreach (Form f in Application.OpenForms) if (f is JanelaLogin && f.Visible && f.Opacity > 0) { f.Activate(); return; }
+        var j = new JanelaLogin(false);
         j.Conectou += delegate { avisouConexao = false; Conferir(!Base.Existe); };
         j.Show();
+    }
+
+    void Desconectar()
+    {
+        if (MessageBox.Show(L.T("Desconectar o Steam Snitcher da sua conta Steam? Ele apaga o navegador dele (com os cookies da Steam) e para de conferir até você entrar de novo.",
+                                "Disconnect Steam Snitcher from your Steam account? It deletes its browser data (including Steam cookies) and stops checking until you sign in again."),
+                Programa.Nome, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        Sessao.Desconectar();
+        Programa.Log("Desconectado da Steam pelo menu.");
+    }
+
+    void AvisarErro(SteamErro ex)
+    {
+        Programa.Log("Erro: " + ex.Message);
+        if (!ex.PrecisaEntrar) return;
+        Sessao.Esquecer();
+        if (avisouConexao) return;
+        avisouConexao = true;
+        ui.BeginInvoke((Action)delegate
+        {
+            if (MessageBox.Show(ex.Message + L.T("\n\nQuer entrar na Steam de novo agora?", "\n\nSign in to Steam again now?"), Programa.Nome,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes) PedirLogin();
+        });
     }
 
     void MostrarLista()
@@ -475,12 +497,18 @@ class Bandeja : ApplicationContext
     void Conferir(bool primeiraVez)
     {
         if (Interlocked.Exchange(ref ocupado, 1) == 1) return;
-        ThreadPool.QueueUserWorkItem(delegate
+        Sessao.ObterToken(
+            token => ThreadPool.QueueUserWorkItem(delegate { ConferirCom(token, primeiraVez); }),
+            (erro, precisaEntrar) => { Interlocked.Exchange(ref ocupado, 0); AvisarErro(new SteamErro(erro, precisaEntrar)); });
+    }
+
+    void ConferirCom(string token, bool primeiraVez)
+    {
         {
             try
             {
                 HashSet<string> desejosAgora;
-                var atual = Steam.LerBiblioteca(out desejosAgora);
+                var atual = Steam.LerBiblioteca(token, out desejosAgora);
                 var desejados = Base.LerDesejos();
                 if (desejosAgora != null) { Base.GravarDesejos(desejosAgora); desejados.UnionWith(desejosAgora); }
                 var antiga = Base.Ler();
@@ -528,25 +556,13 @@ class Bandeja : ApplicationContext
                     });
                 }
             }
-            catch (SteamErro ex)
-            {
-                Programa.Log("Erro: " + ex.Message);
-                if (ex.PrecisaQr && !avisouConexao)
-                {
-                    avisouConexao = true;
-                    ui.BeginInvoke((Action)delegate
-                    {
-                        if (MessageBox.Show(ex.Message + L.T("\n\nQuer conectar de novo agora? (é só apontar o celular para o QR)", "\n\nReconnect now? (just point your phone at the QR code)"), Programa.Nome,
-                            MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes) PedirQr();
-                    });
-                }
-            }
+            catch (SteamErro ex) { AvisarErro(ex); }
             catch (Exception ex)
             {
                 Programa.Log("Falha (internet ou Steam fora do ar), tento no proximo horario: " + ex.Message);
             }
             finally { Interlocked.Exchange(ref ocupado, 0); }
-        });
+        }
     }
 
     void Sair()
@@ -731,92 +747,206 @@ class JanelaLista : Form
     }
 }
 
-class JanelaQr : Form
+// ---------------- sessao: o codigo de acesso vem do site da Steam, dentro do navegador do app ----------------
+static class Sessao
 {
-    public event Action Conectou;
-    readonly PictureBox foto = new PictureBox { SizeMode = PictureBoxSizeMode.AutoSize };
-    readonly Label status = new Label { AutoSize = true, MaximumSize = new Size(420, 0) };
-    readonly Button outro = new Button { Text = L.T("Gerar outro QR", "New QR code"), AutoSize = true, Visible = false };
-    volatile bool fechada;
-    readonly bool demo;
+    public static readonly string PastaPerfil = Path.Combine(Programa.PastaDados, "navegador");
+    static string Marca { get { return Path.Combine(Programa.PastaDados, "conectado.txt"); } }
+    static string token;          // so na memoria; nunca vai para o disco
+    static DateTime vence;
 
-    public JanelaQr(bool demo = false)
+    public static bool Conectado { get { return File.Exists(Marca); } }
+
+    public static void Guardar(string t)
     {
-        this.demo = demo;
-        Text = L.T("Conectar à Steam - ", "Connect to Steam - ") + Programa.Nome;
-        StartPosition = FormStartPosition.CenterScreen;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = MinimizeBox = false;
-        TopMost = true;
-        Font = new Font("Segoe UI", 11f);
-        AutoSize = true;
-        AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        Padding = new Padding(20);
-        var instr = new Label
+        token = t;
+        vence = Steam.VenceToken(t);
+        File.WriteAllText(Marca, DateTime.Now.ToString("yyyy-MM-dd HH:mm"));
+    }
+
+    public static void Esquecer() { token = null; }
+
+    // Chamar na thread da tela. Reaproveita o token ate 10 min antes de vencer (~1 dia);
+    // depois abre o site da Steam escondido, com os cookies do navegador do app, como um navegador ja logado.
+    public static void ObterToken(Action<string> ok, Action<string, bool> falha)
+    {
+        if (token != null && DateTime.UtcNow < vence.AddMinutes(-10)) { ok(token); return; }
+        var j = new JanelaLogin(true);
+        j.Conectou += ok;
+        j.Falhou += falha;
+        j.Show();
+    }
+
+    public static void Desconectar()
+    {
+        token = null;
+        File.Delete(Marca);
+        try { Directory.Delete(PastaPerfil, true); } catch (Exception ex) { Programa.Log("Nao apaguei o navegador: " + ex.Message); }
+    }
+}
+
+// As bibliotecas do WebView2 (Microsoft) vao dentro do .exe e sao extraidas na primeira vez.
+static class Dlls
+{
+    public static readonly string Pasta = Path.Combine(Programa.PastaDados, "lib");
+    static readonly string[] Nomes = { "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll", "WebView2Loader.dll" };
+
+    public static void Preparar()
+    {
+        Directory.CreateDirectory(Pasta);
+        var asm = System.Reflection.Assembly.GetExecutingAssembly();
+        foreach (var n in Nomes)
+            using (var r = asm.GetManifestResourceStream(n))
+            {
+                string f = Path.Combine(Pasta, n);
+                if (File.Exists(f) && new FileInfo(f).Length == r.Length) continue;
+                using (var w = File.Create(f)) r.CopyTo(w);
+            }
+        AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
         {
-            AutoSize = true, MaximumSize = new Size(420, 0),
-            Text = L.T("Para eu ver quem comprou cada jogo da Família, conecte uma vez:\n\n" +
-                   "1. Abra o app Steam no celular.\n2. Toque no escudo (Steam Guard) e em \"Escanear QR\".\n" +
-                   "3. Aponte para o código abaixo e aprove.\n\nNão precisa de senha. Para desconectar um dia: Steam > Dispositivos autorizados.",
-                   "To see who bought each Family game, connect once:\n\n" +
-                   "1. Open the Steam app on your phone.\n2. Tap the shield (Steam Guard), then \"Scan a QR code\".\n" +
-                   "3. Point it at the code below and approve.\n\nNo password needed. To disconnect later: Steam > Authorized devices.")
+            string f = Path.Combine(Pasta, new System.Reflection.AssemblyName(e.Name).Name + ".dll");
+            return File.Exists(f) ? System.Reflection.Assembly.LoadFrom(f) : null;
         };
-        outro.Click += delegate { Comecar(); };
-        var painel = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Dock = DockStyle.Fill };
-        painel.Controls.AddRange(new Control[] { instr, foto, status, outro });
-        Controls.Add(painel);
-        FormClosed += delegate { fechada = true; };
-        Shown += delegate { Comecar(); };
     }
+}
 
-    void Comecar()
+// Janela com o site oficial da Steam. oculto = renovar o codigo sem mostrar nada.
+// Regras: so abre sites https da Steam; sem pop-ups, ferramentas de desenvolvedor, menu, autopreenchimento
+// nem salvar senha; nunca le nem mexe na pagina de login. So le o texto da pagina
+// store.steampowered.com/pointssummary/ajaxgetasyncconfig, que entrega o "webapi_token" ao navegador logado.
+class JanelaLogin : Form
+{
+    public event Action<string> Conectou;
+    public event Action<string, bool> Falhou;
+    const string Config = "https://store.steampowered.com/pointssummary/ajaxgetasyncconfig";
+    static bool loaderPronto;
+    readonly WebView2 web = new WebView2 { Dock = DockStyle.Fill };
+    readonly bool oculto;
+    readonly string perfil;
+    bool lendo, terminou;
+    int tentativas;
+
+    public JanelaLogin(bool oculto, string perfil = null)
     {
-        outro.Visible = false;
-        if (demo) { foto.Image = Qr.Bitmap("https://github.com/Suaviiiii/steam-snitcher", 8); status.Text = L.T("Esperando você aprovar no celular...", "Waiting for you to approve on your phone..."); return; }
-        status.Text = L.T("Gerando o código...", "Creating the code...");
-        ThreadPool.QueueUserWorkItem(delegate { Login(); });
+        this.oculto = oculto;
+        this.perfil = perfil ?? Sessao.PastaPerfil;
+        Text = L.T("Entrar na Steam - ", "Sign in to Steam - ") + Programa.Nome;
+        if (oculto)
+        {
+            ShowInTaskbar = false; FormBorderStyle = FormBorderStyle.None; Opacity = 0;
+            StartPosition = FormStartPosition.Manual; Location = new Point(-3000, -3000); Size = new Size(800, 600);
+            var limite = new System.Windows.Forms.Timer { Interval = 90000 };
+            limite.Tick += delegate { limite.Stop(); Terminar(null, L.T("A Steam demorou demais para responder.", "Steam took too long to answer."), false); };
+            limite.Start();
+        }
+        else
+        {
+            StartPosition = FormStartPosition.CenterScreen; Size = new Size(560, 760);
+            Controls.Add(web);
+            Controls.Add(new Label
+            {
+                Dock = DockStyle.Top, Height = 70, Padding = new Padding(10, 8, 10, 0), Font = new Font("Segoe UI", 9.5f),
+                Text = L.T("Entre com a sua conta no site oficial da Steam, como em qualquer navegador. O Steam Snitcher não vê a sua senha: depois que você entrar, ele só lê o código de acesso que o site da Steam dá ao navegador.",
+                           "Sign in on Steam's official website, as in any browser. Steam Snitcher never sees your password: after you sign in, it only reads the access code Steam's website gives the browser.")
+            });
+        }
+        if (oculto) Controls.Add(web);
+        Load += async delegate { await Iniciar(); };
+        FormClosed += delegate { if (!terminou && !oculto) { terminou = true; if (Falhou != null) Falhou(L.T("Login cancelado.", "Sign-in cancelled."), false); } };
     }
 
-    void Ui(Action a) { if (!fechada && IsHandleCreated) BeginInvoke(a); }
-
-    void Login()
+    async Task Iniciar()
     {
         try
         {
-            var r = Steam.Post("IAuthenticationService/BeginAuthSessionViaQR/v1/",
-                new NameValueCollection { { "device_friendly_name", "PC - " + Programa.Nome }, { "platform_type", "3" } });
-            string cliente = Steam.Txt(r, "client_id"), pedido = Steam.Txt(r, "request_id"), url = Steam.Txt(r, "challenge_url");
-            int intervalo = (int)(double.Parse(Steam.Txt(r, "interval") ?? "5", System.Globalization.CultureInfo.InvariantCulture) * 1000);
-            Ui(delegate { foto.Image = Qr.Bitmap(url, 8); status.Text = L.T("Esperando você aprovar no celular...", "Waiting for you to approve on your phone..."); });
-            DateTime limite = DateTime.Now.AddMinutes(3);
-            while (!fechada && DateTime.Now < limite)
-            {
-                Thread.Sleep(intervalo);
-                var p = Steam.Post("IAuthenticationService/PollAuthSessionStatus/v1/",
-                    new NameValueCollection { { "client_id", cliente }, { "request_id", pedido } });
-                string novaUrl = Steam.Txt(p, "new_challenge_url");
-                if (!string.IsNullOrEmpty(novaUrl)) { string u = novaUrl; Ui(delegate { foto.Image = Qr.Bitmap(u, 8); }); }
-                string refresh = Steam.Txt(p, "refresh_token");
-                if (!string.IsNullOrEmpty(refresh))
-                {
-                    Steam.GuardarToken(refresh);
-                    Programa.Log("Conectado a Steam pelo QR.");
-                    Ui(delegate
-                    {
-                        Close();
-                        if (Conectou != null) Conectou();
-                    });
-                    return;
-                }
-            }
-            Ui(delegate { status.Text = L.T("O código venceu. Clique para gerar outro.", "The code expired. Click to create a new one."); outro.Visible = true; });
+            if (!loaderPronto) { CoreWebView2Environment.SetLoaderDllFolderPath(Dlls.Pasta); loaderPronto = true; }
+            var env = await CoreWebView2Environment.CreateAsync(null, perfil);
+            await web.EnsureCoreWebView2Async(env);
         }
         catch (Exception ex)
         {
-            Programa.Log("Erro no QR: " + ex.Message);
-            Ui(delegate { status.Text = L.T("Não consegui falar com a Steam (internet?). ", "Could not reach Steam (internet?). ") + ex.Message; outro.Visible = true; });
+            Programa.Log("WebView2: " + ex.Message);
+            if (!oculto) MessageBox.Show(L.T("Não consegui abrir o navegador do Windows (WebView2). Instale o \"Microsoft Edge WebView2 Runtime\" no site da Microsoft e tente de novo.\n\n",
+                                             "Could not open the Windows browser component (WebView2). Install the \"Microsoft Edge WebView2 Runtime\" from Microsoft's website and try again.\n\n") + ex.Message,
+                Programa.Nome, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Terminar(null, "WebView2: " + ex.Message, false);
+            return;
         }
+        var c = web.CoreWebView2;
+        var st = c.Settings;
+        st.AreDevToolsEnabled = false; st.AreDefaultContextMenusEnabled = false; st.IsStatusBarEnabled = false;
+        st.IsPasswordAutosaveEnabled = false; st.IsGeneralAutofillEnabled = false;
+        st.IsWebMessageEnabled = false; st.AreHostObjectsAllowed = false;
+        c.NewWindowRequested += (s, e) => { e.Handled = true; };              // sem pop-ups
+        c.NavigationStarting += (s, e) => { if (!SiteDaSteam(e.Uri)) e.Cancel = true; };
+        c.NavigationCompleted += async (s, e) => await Navegou(e.IsSuccess);
+        c.Navigate(oculto ? "https://store.steampowered.com/" : "https://store.steampowered.com/login/");
+    }
+
+    // escondida: nao rouba o foco (de um jogo em tela cheia, por exemplo) e nao aparece na barra de tarefas
+    protected override bool ShowWithoutActivation { get { return oculto; } }
+
+    protected override CreateParams CreateParams
+    {
+        get { var cp = base.CreateParams; if (oculto) cp.ExStyle |= 0x08000000 | 0x80; return cp; } // NOACTIVATE | TOOLWINDOW
+    }
+
+    static bool SiteDaSteam(string url)
+    {
+        Uri u;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out u) || u.Scheme != "https") return false;
+        string h = u.Host.ToLowerInvariant();
+        return h == "steampowered.com" || h.EndsWith(".steampowered.com") || h == "steamcommunity.com" || h.EndsWith(".steamcommunity.com");
+    }
+
+    async Task Navegou(bool deuCerto)
+    {
+        if (terminou) return;
+        var u = web.Source;
+        if (lendo)
+        {
+            lendo = false;
+            string token = null;
+            try
+            {
+                var js = new JavaScriptSerializer();
+                string texto = js.Deserialize<string>(await web.CoreWebView2.ExecuteScriptAsync("document.body ? document.body.innerText : ''"));
+                var d = js.DeserializeObject(texto) as Dictionary<string, object>;
+                var dados = d != null && d.ContainsKey("data") ? d["data"] as Dictionary<string, object> : null;
+                token = dados != null && dados.ContainsKey("webapi_token") ? Convert.ToString(dados["webapi_token"]) : null;
+            }
+            catch (Exception ex) { Programa.Log("Nao li o codigo de acesso: " + ex.Message); }
+            if (!string.IsNullOrEmpty(token)) { Terminar(token, null, false); return; }
+            // sem codigo: a Steam ainda nao terminou de renovar o login, ou a pessoa saiu da conta
+            if (++tentativas < 3) { await Task.Delay(3000); if (!terminou) web.CoreWebView2.Navigate("https://store.steampowered.com/"); return; }
+            if (oculto) Terminar(null, L.T("A Steam pediu para você entrar de novo.", "Steam asked you to sign in again."), true);
+            else web.CoreWebView2.Navigate("https://store.steampowered.com/login/");
+            return;
+        }
+        if (!deuCerto)
+        {
+            if (oculto) Terminar(null, L.T("Sem internet, ou a Steam está fora do ar.", "No internet, or Steam is down."), false);
+            return; // na janela visivel a pessoa ve o erro e pode tentar de novo
+        }
+        if (perfil != Sessao.PastaPerfil) return; // demonstracao: so mostra a pagina
+        bool naLoja = u.Host == "store.steampowered.com" && !u.AbsolutePath.StartsWith("/login", StringComparison.OrdinalIgnoreCase);
+        if (naLoja) { lendo = true; web.CoreWebView2.Navigate(Config); }
+        else if (oculto && u.AbsolutePath.StartsWith("/login", StringComparison.OrdinalIgnoreCase))
+            Terminar(null, L.T("A Steam pediu para você entrar de novo.", "Steam asked you to sign in again."), true);
+    }
+
+    void Terminar(string token, string erro, bool precisaEntrar)
+    {
+        if (terminou) return;
+        terminou = true;
+        if (token != null)
+        {
+            Sessao.Guardar(token);
+            if (!oculto) Programa.Log("Entrou na Steam pelo site.");
+            if (Conectou != null) Conectou(token);
+        }
+        else if (Falhou != null) Falhou(erro, precisaEntrar);
+        BeginInvoke((Action)Close);
     }
 }
 
@@ -844,12 +974,12 @@ static class Demo
         var lista = new JanelaLista(jogos, busca);
         var icone = new NotifyIcon { Icon = SystemIcons.Information, Text = Programa.Nome + " (demo)", Visible = true };
         Action nada = delegate { };
-        icone.ContextMenuStrip = Bandeja.CriarMenu(nada, nada, nada, delegate { lista.Close(); });
+        icone.ContextMenuStrip = Bandeja.CriarMenu(nada, nada, nada, nada, delegate { lista.Close(); });
         lista.FormClosed += delegate { icone.Visible = false; };
         lista.Shown += delegate
         {
             if (busca != null) return; // so a lista, para o print da busca
-            new JanelaQr(true).Show();
+            new JanelaLogin(false, Path.Combine(Path.GetTempPath(), "SteamSnitcherDemo")).Show(); // perfil vazio: nunca mostra a sua conta
             Aviso.Mostrar(hk, L.T("EXEMPLO", "EXAMPLE"), L.T("É assim que vai aparecer o jogo novo adicionado na biblioteca", "This is how a new game added to your library will show up"), nada);
             Aviso.Mostrar(hades, L.T("NOVO NA BIBLIOTECA", "NEW IN YOUR LIBRARY"), null, nada);
             Aviso.Mostrar(wukong, L.Desejos, L.FraseDesejo(wukong), nada);
@@ -859,111 +989,5 @@ static class Demo
             t.Start();
         };
         Application.Run(lista);
-    }
-}
-
-// ---------------- QR code (versao 3, correcao L, ate 53 letras) ----------------
-static class Qr
-{
-    const int V = 3, N = 29, DADOS = 55, ECC = 15;
-
-    public static Bitmap Bitmap(string texto, int escala)
-    {
-        bool[,] m = Gerar(texto);
-        int borda = 4, lado = (N + 2 * borda) * escala;
-        var bmp = new Bitmap(lado, lado);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.Clear(Color.White);
-            for (int y = 0; y < N; y++)
-                for (int x = 0; x < N; x++)
-                    if (m[y, x]) g.FillRectangle(Brushes.Black, (x + borda) * escala, (y + borda) * escala, escala, escala);
-        }
-        return bmp;
-    }
-
-    public static bool[,] Gerar(string texto)
-    {
-        byte[] b = Encoding.ASCII.GetBytes(texto);
-        if (b.Length > 53) throw new ArgumentException("Texto grande demais para o QR.");
-        var bits = new List<bool>();
-        Action<int, int> por = (val, n) => { for (int i = n - 1; i >= 0; i--) bits.Add(((val >> i) & 1) != 0); };
-        por(4, 4); por(b.Length, 8);
-        foreach (byte c in b) por(c, 8);
-        por(0, Math.Min(4, DADOS * 8 - bits.Count));
-        while (bits.Count % 8 != 0) bits.Add(false);
-        var dados = new List<byte>();
-        for (int i = 0; i < bits.Count; i += 8) { int v = 0; for (int j = 0; j < 8; j++) v = (v << 1) | (bits[i + j] ? 1 : 0); dados.Add((byte)v); }
-        for (int p = 0; dados.Count < DADOS; p++) dados.Add(p % 2 == 0 ? (byte)0xEC : (byte)0x11);
-        var todos = dados.Concat(Correcao(dados.ToArray())).ToArray();
-
-        var mod = new bool[N, N];
-        var fixo = new bool[N, N];
-        Action<int, int, bool> pos = (x, y, escuro) => { mod[y, x] = escuro; fixo[y, x] = true; };
-        for (int i = 0; i < N; i++) { pos(6, i, i % 2 == 0); pos(i, 6, i % 2 == 0); }
-        foreach (var c in new[] { new[] { 3, 3 }, new[] { N - 4, 3 }, new[] { 3, N - 4 } })
-            for (int dy = -4; dy <= 4; dy++)
-                for (int dx = -4; dx <= 4; dx++)
-                {
-                    int x = c[0] + dx, y = c[1] + dy, d = Math.Max(Math.Abs(dx), Math.Abs(dy));
-                    if (x >= 0 && x < N && y >= 0 && y < N) pos(x, y, d != 2 && d != 4);
-                }
-        for (int dy = -2; dy <= 2; dy++)
-            for (int dx = -2; dx <= 2; dx++) pos(22 + dx, 22 + dy, Math.Max(Math.Abs(dx), Math.Abs(dy)) != 1);
-
-        // formato: nivel L (01) + mascara 0
-        int dado = (1 << 3) | 0, rem = dado;
-        for (int i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >> 9) * 0x537);
-        int f = ((dado << 10) | rem) ^ 0x5412;
-        Func<int, bool> fb = i => ((f >> i) & 1) != 0;
-        for (int i = 0; i <= 5; i++) pos(8, i, fb(i));
-        pos(8, 7, fb(6)); pos(8, 8, fb(7)); pos(7, 8, fb(8));
-        for (int i = 9; i < 15; i++) pos(14 - i, 8, fb(i));
-        for (int i = 0; i < 8; i++) pos(N - 1 - i, 8, fb(i));
-        for (int i = 8; i < 15; i++) pos(8, N - 15 + i, fb(i));
-        pos(8, N - 8, true);
-
-        int k = 0;
-        for (int dir = N - 1; dir >= 1; dir -= 2)
-        {
-            if (dir == 6) dir = 5;
-            for (int v = 0; v < N; v++)
-                for (int j = 0; j < 2; j++)
-                {
-                    int x = dir - j, y = ((dir + 1) & 2) == 0 ? N - 1 - v : v;
-                    if (fixo[y, x]) continue;
-                    if (k < todos.Length * 8) mod[y, x] = ((todos[k >> 3] >> (7 - (k & 7))) & 1) != 0;
-                    k++;
-                    if ((x + y) % 2 == 0) mod[y, x] = !mod[y, x]; // mascara 0
-                }
-        }
-        return mod;
-    }
-
-    static int Mul(int x, int y)
-    {
-        int z = 0;
-        for (int i = 7; i >= 0; i--) { z = (z << 1) ^ ((z >> 7) * 0x11D); z ^= ((y >> i) & 1) * x; }
-        return z;
-    }
-
-    static byte[] Correcao(byte[] dados)
-    {
-        var div = new int[ECC];
-        div[ECC - 1] = 1;
-        int raiz = 1;
-        for (int i = 0; i < ECC; i++)
-        {
-            for (int j = 0; j < ECC; j++) { div[j] = Mul(div[j], raiz); if (j + 1 < ECC) div[j] ^= div[j + 1]; }
-            raiz = Mul(raiz, 2);
-        }
-        var r = new int[ECC];
-        foreach (byte b in dados)
-        {
-            int fator = b ^ r[0];
-            Array.Copy(r, 1, r, 0, ECC - 1); r[ECC - 1] = 0;
-            for (int i = 0; i < ECC; i++) r[i] ^= Mul(div[i], fator);
-        }
-        return r.Select(x => (byte)x).ToArray();
     }
 }
