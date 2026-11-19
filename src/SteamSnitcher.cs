@@ -1,10 +1,8 @@
-﻿// Steam Snitcher: confere a biblioteca Steam (com a Familia Steam) a cada 2 horas
-// e mostra um aviso fixo quando aparece jogo novo, dizendo quem comprou
-// (e avisando quando foi um jogo da sua lista de desejos).
-// Login: no site oficial da Steam, numa janela de navegador (WebView2) dentro do app.
-// O app nao ve a senha e nao se apresenta como outro aparelho: usa o codigo de acesso que o
-// proprio site da Steam da ao navegador (a primeira versao usava QR "de celular" e a Steam
-// travou a conta por "dispositivo inesperado").
+﻿// Steam Snitcher (modo 100% local): confere a cada 2 horas os jogos instalados neste PC e mostra
+// um aviso fixo quando aparece um jogo novo, dizendo de quem e (quem comprou, na Familia Steam).
+// Nao faz login, nao conecta na Steam nem na internet: so LE arquivos que a propria Steam grava no PC
+// (steamapps\appmanifest_*.acf, config\loginusers.vdf, userdata\...\localconfig.vdf, appcache\librarycache).
+// Historia: a 1.0 entrava por QR "de celular" e a Steam travou a conta; a 1.1 (login pelo site) nunca foi publicada.
 // Compilar: build.cmd (usa o csc.exe que ja vem no Windows, .NET Framework 4).
 using System;
 using System.Collections.Generic;
@@ -12,12 +10,9 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
-using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.Web.WebView2.Core;
-using Microsoft.Web.WebView2.WinForms;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -36,28 +31,11 @@ static class Programa
     static int Main(string[] args)
     {
         SetProcessDPIAware();
-        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-        if (args.Contains("--demo")) { Dlls.Preparar(); Application.EnableVisualStyles(); Demo.Rodar(args.Length > 1 ? args[1] : null); return 0; } // dados falsos, nao instala nada
+        if (args.Contains("--demo")) { Application.EnableVisualStyles(); Demo.Rodar(args.Length > 1 ? args[1] : null); return 0; } // dados falsos, nao instala nada
         MigrarVersaoAntiga();
         Directory.CreateDirectory(PastaDados);
-        Dlls.Preparar();
         ApagarConexaoQr();
         if (args.Contains("--teste-aviso")) { Base.TirarUmParaTeste(); Sinal("Conferir"); return 0; }
-        if (args.Contains("--teste-sessao")) // so tenta renovar o codigo, escondido, e anota o resultado no registro
-        {
-            Application.EnableVisualStyles();
-            var ctx = new ApplicationContext();
-            var t = new System.Windows.Forms.Timer { Interval = 100 };
-            t.Tick += delegate
-            {
-                t.Stop();
-                Sessao.ObterToken(tk => { Log("teste-sessao: codigo obtido, vence " + Steam.VenceToken(tk).ToLocalTime()); ctx.ExitThread(); },
-                                  (erro, entrar) => { Log("teste-sessao: " + erro + " | precisa entrar=" + entrar); ctx.ExitThread(); });
-            };
-            t.Start();
-            Application.Run(ctx);
-            return 0;
-        }
 
         bool instalado = string.Equals(Path.GetFullPath(Application.ExecutablePath), ExeInstalado, StringComparison.OrdinalIgnoreCase);
         bool primeira;
@@ -127,7 +105,7 @@ static class Programa
             dynamic sh = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
             dynamic lnk = sh.CreateShortcut(atalho);
             lnk.TargetPath = ExeInstalado;
-            lnk.Description = L.T("Ver a lista de jogos da biblioteca Steam com os donos", "See your Steam library games and who bought each one");
+            lnk.Description = L.T("Ver os jogos instalados e de quem é cada um", "See your installed games and who owns each one");
             lnk.Save();
         }
         catch (Exception ex)
@@ -153,134 +131,86 @@ static class L
     public static readonly bool Pt = string.IsNullOrEmpty(Forcado)
         ? System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "pt" : Forcado == "pt";
     public static string T(string pt, string en) { return Pt ? pt : en; }
-    public static readonly string Desejos = T("DA SUA LISTA DE DESEJOS", "FROM YOUR WISHLIST");
-    public static string FraseDesejo(Jogo j)
-    {
-        return string.Format(T("Ei, {0} comprou {1} da sua lista de desejos!", "Hey, {0} bought {1} from your wishlist!"), j.Donos, j.Nome);
-    }
+    public static readonly string Novo = T("NOVO NO PC", "NEW ON YOUR PC");
+    public static readonly string Exemplo = T("É assim que vai aparecer quando um jogo novo for instalado no PC", "This is how it will show up when a new game is installed on your PC");
 }
 
-// ---------------- Steam (Web API oficial) ----------------
-class SteamErro : Exception
-{
-    public bool PrecisaEntrar;
-    public SteamErro(string m, bool precisaEntrar) : base(m) { PrecisaEntrar = precisaEntrar; }
-}
-
-static class Steam
+// ---------------- Steam: so leitura dos arquivos que a Steam grava no PC ----------------
+static class SteamLocal
 {
     static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
-    const string Api = "https://api.steampowered.com/";
+    const ulong Id64 = 76561197960265728UL; // SteamID64 = numero da conta + este valor
 
-    static Dictionary<string, object> Resposta(string texto)
+    public static string Pasta()
     {
-        var d = Json.DeserializeObject(texto) as Dictionary<string, object>;
-        object r;
-        return d != null && d.TryGetValue("response", out r) && r is Dictionary<string, object> ? (Dictionary<string, object>)r : new Dictionary<string, object>();
+        string p = Convert.ToString(Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", ""));
+        if (p == "" || !Directory.Exists(p)) throw new Exception(L.T("Não achei a Steam neste PC.", "Steam was not found on this PC."));
+        return p.Replace('/', '\\');
     }
 
-    public static Dictionary<string, object> Get(string metodo, string query)
+    // A conta deste PC: a que esta aberta agora; com a Steam fechada, a ultima que entrou.
+    public static string Eu(string steam)
     {
-        using (var wc = new WebClient())
+        int ativa = Convert.ToInt32(Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "ActiveUser", 0) ?? 0);
+        if (ativa != 0) return ((ulong)(uint)ativa + Id64).ToString();
+        string arq = Path.Combine(steam, "config", "loginusers.vdf");
+        if (!File.Exists(arq)) return null;
+        string melhor = null; long maior = -1;
+        foreach (Match m in Regex.Matches(File.ReadAllText(arq), "\"(\\d{17})\"\\s*\\{([^}]*)\\}"))
         {
-            wc.Encoding = Encoding.UTF8;
-            return Resposta(wc.DownloadString(Api + metodo + "?" + query));
+            var ts = Regex.Match(m.Groups[2].Value, "\"timestamp\"\\s+\"(\\d+)\"");
+            long v = ts.Success ? long.Parse(ts.Groups[1].Value) : 0;
+            if (v > maior) { maior = v; melhor = m.Groups[1].Value; }
         }
+        return melhor;
     }
 
-    public static string Txt(Dictionary<string, object> d, string chave)
+    static string Campo(string vdf, string nome)
     {
-        object v;
-        return d != null && d.TryGetValue(chave, out v) && v != null ? Convert.ToString(v) : null;
+        var m = Regex.Match(vdf, "\"" + nome + "\"\\s+\"((?:[^\"\\\\]|\\\\.)*)\"");
+        return m.Success ? m.Groups[1].Value.Replace("\\\"", "\"").Replace("\\\\", "\\") : null;
     }
 
-    public static IEnumerable<Dictionary<string, object>> Lista(Dictionary<string, object> d, string chave)
+    // Jogos instalados (um appmanifest por jogo, em cada pasta de biblioteca da Steam).
+    // "LastOwner" e a conta cuja licenca a Steam usa para o jogo: num jogo da Familia, e quem comprou.
+    public static Dictionary<string, Jogo> LerInstalados()
     {
-        object v;
-        if (d == null || !d.TryGetValue(chave, out v) || !(v is object[])) return new Dictionary<string, object>[0];
-        return ((object[])v).OfType<Dictionary<string, object>>();
-    }
-
-    // Le o campo "sub" (steamid) de dentro do token JWT.
-    public static string SteamIdDoToken(string jwt)
-    {
-        string p = jwt.Split('.')[1].Replace('-', '+').Replace('_', '/');
-        p = p.PadRight(p.Length + (4 - p.Length % 4) % 4, '=');
-        var d = Json.DeserializeObject(Encoding.UTF8.GetString(Convert.FromBase64String(p))) as Dictionary<string, object>;
-        return Txt(d, "sub");
-    }
-
-    // Validade do token (campo "exp" do JWT), em UTC.
-    public static DateTime VenceToken(string jwt)
-    {
-        string p = jwt.Split('.')[1].Replace('-', '+').Replace('_', '/');
-        p = p.PadRight(p.Length + (4 - p.Length % 4) % 4, '=');
-        var d = Json.DeserializeObject(Encoding.UTF8.GetString(Convert.FromBase64String(p))) as Dictionary<string, object>;
-        return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(Convert.ToDouble(d["exp"]));
-    }
-
-    // Lista completa: appid -> (nome, donos). Tambem devolve os appids da sua lista de desejos (vazia se falhar).
-    public static Dictionary<string, Jogo> LerBiblioteca(string token, out HashSet<string> desejos)
-    {
-        string eu = SteamIdDoToken(token);
-        string tk = Uri.EscapeDataString(token);
-        desejos = new HashSet<string>();
-        try
-        {
-            var w = Get("IWishlistService/GetWishlist/v1/", "access_token=" + tk + "&steamid=" + eu);
-            foreach (var i in Lista(w, "items")) desejos.Add(Txt(i, "appid"));
-        }
-        catch (Exception ex) { Programa.Log("Nao li a lista de desejos: " + ex.Message); desejos = null; }
-        Dictionary<string, object> fam;
-        try { fam = Get("IFamilyGroupsService/GetFamilyGroupForUser/v1/", "access_token=" + tk + "&steamid=" + eu + "&include_family_group_response=true"); }
-        catch (WebException ex)
-        {
-            var h = ex.Response as HttpWebResponse;
-            if (h != null && (h.StatusCode == HttpStatusCode.Unauthorized || h.StatusCode == HttpStatusCode.Forbidden))
-                throw new SteamErro(L.T("A Steam pediu para você entrar de novo.", "Steam asked you to sign in again."), true);
-            throw;
-        }
-        string grupo = Txt(fam, "family_groupid");
-        if (string.IsNullOrEmpty(grupo) || grupo == "0") throw new SteamErro(L.T("Esta conta não está numa Família Steam.", "This account is not in a Steam Family."), false);
-
-        var libr = Get("IFamilyGroupsService/GetSharedLibraryApps/v1/", "access_token=" + tk + "&family_groupid=" + grupo +
-            "&include_own=true&include_excluded=true&language=" + L.T("brazilian", "english") + "&steamid=" + eu);
-
+        string steam = Pasta(), eu = Eu(steam);
+        var pastas = new List<string> { steam };
+        string lf = Path.Combine(steam, "steamapps", "libraryfolders.vdf");
+        if (File.Exists(lf))
+            foreach (Match m in Regex.Matches(File.ReadAllText(lf), "\"path\"\\s+\"([^\"]+)\"")) pastas.Add(m.Groups[1].Value.Replace("\\\\", "\\"));
+        var nomes = NomesDasContas(steam, eu);
         var jogos = new Dictionary<string, Jogo>();
-        var todosDonos = new HashSet<string>();
-        foreach (var a in Lista(libr, "apps"))
+        foreach (var p in pastas.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            object o;
-            var donos = a.TryGetValue("owner_steamids", out o) && o is object[] ? ((object[])o).Select(Convert.ToString).ToList() : new List<string>();
-            bool meu = donos.Contains(eu);
-            string excl = Txt(a, "exclude_reason");
-            if (!meu && excl != null && excl != "0") continue; // jogo de outro membro que nao esta sendo compartilhado
-            string id = Txt(a, "appid");
-            jogos[id] = new Jogo { AppId = id, Nome = Txt(a, "name") ?? ("App " + id), DonosIds = donos };
-            foreach (var d in donos) todosDonos.Add(d);
-        }
-        if (jogos.Count == 0) throw new SteamErro(L.T("A Steam devolveu a biblioteca vazia (deve ser falha temporária).", "Steam returned an empty library (probably a temporary error)."), false);
-
-        var nomes = NomesDasContas(eu);
-        foreach (var j in jogos.Values)
-        {
-            j.Meu = j.DonosIds.Contains(eu);
-            j.Donos = string.Join(L.T(" e ", " and "), j.DonosIds.Select(d => d == eu
-                ? L.T("Você (", "You (") + (nomes.ContainsKey(d) ? nomes[d] : L.T("sua conta", "your account")) + ")"
-                : (nomes.ContainsKey(d) ? nomes[d] : L.T("conta ", "account ") + d)));
+            string sa = Path.Combine(p, "steamapps");
+            if (!Directory.Exists(sa)) continue;
+            foreach (var f in Directory.GetFiles(sa, "appmanifest_*.acf"))
+            {
+                string t;
+                try { t = File.ReadAllText(f, Encoding.UTF8); } catch { continue; } // a Steam pode estar gravando o arquivo
+                string id = Campo(t, "appid"), dono = Campo(t, "LastOwner");
+                // shortcut: so pula o "Steamworks Common Redistributables"; se outras ferramentas aparecerem como jogo, filtrar aqui
+                if (id == null || id == "228980") continue;
+                bool meu = dono != null && dono == eu;
+                string nomeDono = dono == null || dono == "0" ? L.T("desconhecido", "unknown")
+                    : meu ? L.T("Você (", "You (") + (nomes.ContainsKey(dono) ? nomes[dono] : L.T("sua conta", "your account")) + ")"
+                    : nomes.ContainsKey(dono) ? nomes[dono] : L.T("conta ", "account ") + dono;
+                jogos[id] = new Jogo { AppId = id, Nome = Campo(t, "name") ?? ("App " + id), Donos = nomeDono, Meu = meu };
+            }
         }
         return jogos;
     }
 
     // Nomes das contas: o cliente Steam guarda um cache dos amigos (com os membros da Familia) no localconfig.vdf.
-    static Dictionary<string, string> NomesDasContas(string eu)
+    static Dictionary<string, string> NomesDasContas(string steam, string eu)
     {
         var nomes = new Dictionary<string, string>();
+        if (eu == null) return nomes;
         try
         {
-            string steam = Convert.ToString(Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", ""));
-            string conta = (ulong.Parse(eu) - 76561197960265728UL).ToString();
-            string arq = Path.Combine(steam, "userdata", conta, "config", "localconfig.vdf");
+            string arq = Path.Combine(steam, "userdata", (ulong.Parse(eu) - Id64).ToString(), "config", "localconfig.vdf");
             foreach (var linha in File.ReadLines(arq, Encoding.UTF8))
             {
                 int i = linha.IndexOf("\"friendstore_playercache\"");
@@ -289,8 +219,8 @@ static class Steam
                 v = v.Substring(0, v.LastIndexOf('"')).Replace("\\\"", "\"").Replace("\\\\", "\\");
                 foreach (var o in (object[])Json.DeserializeObject(v))
                 {
-                    var p = o as Dictionary<string, object>;
-                    if (p != null && Txt(p, "steamid") != null) nomes[Txt(p, "steamid")] = Txt(p, "persona_name");
+                    var d = o as Dictionary<string, object>;
+                    if (d != null && d.ContainsKey("steamid")) nomes[Convert.ToString(d["steamid"])] = Convert.ToString(d["persona_name"]);
                 }
             }
         }
@@ -302,29 +232,21 @@ static class Steam
 class Jogo
 {
     public string AppId, Nome, Donos, Desde;
-    public List<string> DonosIds = new List<string>();
-    public bool Meu;   // voce e um dos donos
+    public bool Meu;   // voce e o dono
     public Image Capa;
 
-    // Capinha do jogo (a mesma da loja). Sem internet ou sem imagem: aviso sai sem foto.
-    public void BaixarCapa()
+    // Capinha do jogo: a mesma imagem que a biblioteca da Steam ja guardou no PC. Sem imagem, o aviso sai sem foto.
+    public void LerCapa()
     {
-        foreach (var url in new[] {
-            "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/" + AppId + "/capsule_sm_120.jpg",
-            "https://cdn.cloudflare.steamstatic.com/steam/apps/" + AppId + "/capsule_sm_120.jpg" })
-        {
-            try { using (var wc = new WebClient()) Capa = Image.FromStream(new MemoryStream(wc.DownloadData(url))); return; }
-            catch { }
-        }
-        // jogos novos guardam a imagem num endereco com codigo: a loja diz qual e
         try
         {
-            using (var wc = new WebClient())
-            {
-                var r = new JavaScriptSerializer().DeserializeObject(wc.DownloadString("https://store.steampowered.com/api/appdetails?filters=basic&appids=" + AppId)) as Dictionary<string, object>;
-                var dados = ((Dictionary<string, object>)r[AppId])["data"] as Dictionary<string, object>;
-                Capa = Image.FromStream(new MemoryStream(wc.DownloadData(Convert.ToString(dados["header_image"]))));
-            }
+            string pasta = Path.Combine(SteamLocal.Pasta(), "appcache", "librarycache", AppId);
+            if (!Directory.Exists(pasta)) return;
+            string f = Directory.GetFiles(pasta, "library_header.jpg", SearchOption.AllDirectories)
+                .Concat(Directory.GetFiles(pasta, "header.jpg", SearchOption.AllDirectories)).FirstOrDefault();
+            if (f == null) return;
+            using (var fs = File.OpenRead(f))
+            using (var img = Image.FromStream(fs)) Capa = new Bitmap(img); // copia: nao deixa o arquivo da Steam preso
         }
         catch { }
     }
@@ -333,7 +255,7 @@ class Jogo
 // ---------------- base local (arquivo de texto separado por TAB) ----------------
 static class Base
 {
-    static string Arq { get { return Path.Combine(Programa.PastaDados, "biblioteca.txt"); } }
+    static string Arq { get { return Path.Combine(Programa.PastaDados, "instalados.txt"); } }
 
     public static bool Existe { get { return File.Exists(Arq); } }
 
@@ -364,17 +286,6 @@ static class Base
 
     static string Limpo(string s) { return (s ?? "").Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' '); }
 
-    // Lista de desejos da conferencia anterior: quando alguem da Familia compra um jogo dela,
-    // a Steam pode tira-lo da lista, entao comparamos tambem com a lista antiga.
-    static string ArqDesejos { get { return Path.Combine(Programa.PastaDados, "lista_desejos.txt"); } }
-
-    public static HashSet<string> LerDesejos()
-    {
-        return File.Exists(ArqDesejos) ? new HashSet<string>(File.ReadAllLines(ArqDesejos).Where(l => l.Trim() != "")) : new HashSet<string>();
-    }
-
-    public static void GravarDesejos(HashSet<string> d) { File.WriteAllLines(ArqDesejos, d.OrderBy(x => x)); }
-
     // Para o teste: tira o ultimo jogo da base, assim a proxima conferencia o acha como "novo".
     public static void TirarUmParaTeste()
     {
@@ -393,7 +304,6 @@ class Bandeja : ApplicationContext
     readonly Control ui = new Control();
     DateTime proxima;
     int ocupado;
-    bool avisouConexao;
     readonly List<Thread> ouvintes = new List<Thread>();
 
     public Bandeja(bool mostrarLista, bool recemInstalado)
@@ -401,7 +311,7 @@ class Bandeja : ApplicationContext
         ui.CreateControl();
         icone.Icon = SystemIcons.Information;
         icone.Text = Programa.Nome;
-        icone.ContextMenuStrip = CriarMenu(MostrarLista, delegate { Conferir(false); }, PedirLogin, Desconectar, Sair);
+        icone.ContextMenuStrip = CriarMenu(MostrarLista, delegate { Conferir(false); }, Sair);
         icone.DoubleClick += delegate { MostrarLista(); };
         icone.Visible = true;
 
@@ -419,24 +329,21 @@ class Bandeja : ApplicationContext
             Conferir(false);
         };
         relogio.Start();
-        Programa.Log("Iniciado. Proxima conferencia: " + proxima.ToString("dd/MM HH:mm"));
+        Programa.Log("Iniciado (modo local). Proxima conferencia: " + proxima.ToString("dd/MM HH:mm"));
 
-        if (!Sessao.Conectado) { PedirLogin(); return; }
         if (!Base.Existe || recemInstalado) { Conferir(true); return; } // ao instalar mostra o aviso de exemplo
         if (mostrarLista) MostrarLista();
-        // ao ligar o PC tambem confere uma vez (pega jogos que entraram com o PC desligado)
+        // ao ligar o PC tambem confere uma vez (pega jogos instalados com o app fechado)
         var espera = new System.Windows.Forms.Timer { Interval = 60000 };
         espera.Tick += delegate { espera.Stop(); Conferir(false); };
         espera.Start();
     }
 
-    public static ContextMenuStrip CriarMenu(Action lista, Action conferir, Action entrar, Action desconectar, Action sair)
+    public static ContextMenuStrip CriarMenu(Action lista, Action conferir, Action sair)
     {
         var menu = new ContextMenuStrip();
         menu.Items.Add(L.T("Ver lista de jogos e donos", "See games and owners"), null, delegate { lista(); });
         menu.Items.Add(L.T("Conferir agora", "Check now"), null, delegate { conferir(); });
-        menu.Items.Add(L.T("Entrar na Steam de novo", "Sign in to Steam again"), null, delegate { entrar(); });
-        menu.Items.Add(L.T("Desconectar da Steam", "Disconnect from Steam"), null, delegate { desconectar(); });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(L.T("Sair", "Exit"), null, delegate { sair(); });
         return menu;
@@ -456,37 +363,6 @@ class Bandeja : ApplicationContext
         ouvintes.Add(t);
     }
 
-    void PedirLogin()
-    {
-        foreach (Form f in Application.OpenForms) if (f is JanelaLogin && f.Visible && f.Opacity > 0) { f.Activate(); return; }
-        var j = new JanelaLogin(false);
-        j.Conectou += delegate { avisouConexao = false; Conferir(!Base.Existe); };
-        j.Show();
-    }
-
-    void Desconectar()
-    {
-        if (MessageBox.Show(L.T("Desconectar o Steam Snitcher da sua conta Steam? Ele apaga o navegador dele (com os cookies da Steam) e para de conferir até você entrar de novo.",
-                                "Disconnect Steam Snitcher from your Steam account? It deletes its browser data (including Steam cookies) and stops checking until you sign in again."),
-                Programa.Nome, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        Sessao.Desconectar();
-        Programa.Log("Desconectado da Steam pelo menu.");
-    }
-
-    void AvisarErro(SteamErro ex)
-    {
-        Programa.Log("Erro: " + ex.Message);
-        if (!ex.PrecisaEntrar) return;
-        Sessao.Esquecer();
-        if (avisouConexao) return;
-        avisouConexao = true;
-        ui.BeginInvoke((Action)delegate
-        {
-            if (MessageBox.Show(ex.Message + L.T("\n\nQuer entrar na Steam de novo agora?", "\n\nSign in to Steam again now?"), Programa.Nome,
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes) PedirLogin();
-        });
-    }
-
     void MostrarLista()
     {
         foreach (Form f in Application.OpenForms) if (f is JanelaLista) { f.Close(); break; }
@@ -497,22 +373,13 @@ class Bandeja : ApplicationContext
     void Conferir(bool primeiraVez)
     {
         if (Interlocked.Exchange(ref ocupado, 1) == 1) return;
-        Sessao.ObterToken(
-            token => ThreadPool.QueueUserWorkItem(delegate { ConferirCom(token, primeiraVez); }),
-            (erro, precisaEntrar) => { Interlocked.Exchange(ref ocupado, 0); AvisarErro(new SteamErro(erro, precisaEntrar)); });
-    }
-
-    void ConferirCom(string token, bool primeiraVez)
-    {
+        ThreadPool.QueueUserWorkItem(delegate
         {
             try
             {
-                HashSet<string> desejosAgora;
-                var atual = Steam.LerBiblioteca(token, out desejosAgora);
-                var desejados = Base.LerDesejos();
-                if (desejosAgora != null) { Base.GravarDesejos(desejosAgora); desejados.UnionWith(desejosAgora); }
+                var atual = SteamLocal.LerInstalados();
+                bool semBase = !Base.Existe;
                 var antiga = Base.Ler();
-                bool semBase = antiga.Count == 0;
                 string hoje = DateTime.Now.ToString("yyyy-MM-dd HH:mm"); // ano-mes-dia: ordena certo
                 var novos = new List<Jogo>();
                 foreach (var j in atual.Values)
@@ -521,48 +388,43 @@ class Bandeja : ApplicationContext
                     if (antiga.TryGetValue(j.AppId, out velho)) j.Desde = velho.Desde;
                     else { j.Desde = hoje; novos.Add(j); }
                 }
-                bool mudou = novos.Count > 0 || antiga.Keys.Any(k => !atual.ContainsKey(k)) || atual.Values.Any(j => antiga.ContainsKey(j.AppId) && antiga[j.AppId].Donos != j.Donos);
+                // jogo desinstalado sai da base; se for instalado de novo, avisa de novo
+                bool mudou = semBase || novos.Count > 0 || antiga.Keys.Any(k => !atual.ContainsKey(k)) || atual.Values.Any(j => antiga.ContainsKey(j.AppId) && antiga[j.AppId].Donos != j.Donos);
                 if (mudou) Base.Gravar(atual.Values);
-                Programa.Log(string.Format("Conferido: {0} jogos, {1} novos.", atual.Count, semBase ? 0 : novos.Count));
+                Programa.Log(string.Format("Conferido: {0} jogos instalados, {1} novos.", atual.Count, semBase ? 0 : novos.Count));
 
                 if (semBase || primeiraVez)
                 {
+                    if (atual.Count == 0) { ui.BeginInvoke((Action)MostrarLista); return; }
                     // de exemplo, um jogo de outro membro da Familia (mostra melhor o "comprado por")
                     var exemplo = atual.Values.OrderBy(j => j.Meu ? 1 : 0).First();
-                    exemplo.BaixarCapa();
+                    exemplo.LerCapa();
                     ui.BeginInvoke((Action)delegate
                     {
                         MostrarLista();
-                        Aviso.Mostrar(exemplo, L.T("EXEMPLO", "EXAMPLE"), L.T("É assim que vai aparecer o jogo novo adicionado na biblioteca", "This is how a new game added to your library will show up"), MostrarLista);
+                        Aviso.Mostrar(exemplo, L.T("EXEMPLO", "EXAMPLE"), L.Exemplo, MostrarLista);
                     });
                 }
                 else if (novos.Count > 0)
                 {
-                    // muitos de uma vez (ex.: membro novo na Familia): 4 avisos + 1 resumo, para nao encher a tela
-                    novos = novos.OrderBy(j => desejados.Contains(j.AppId) ? 0 : 1).ToList(); // os da lista de desejos primeiro
+                    // muitos de uma vez: 4 avisos + 1 resumo, para nao encher a tela
                     var mostrar = novos.Count <= 5 ? novos : novos.Take(4).ToList();
-                    foreach (var j in mostrar) j.BaixarCapa();
+                    foreach (var j in mostrar) j.LerCapa();
                     ui.BeginInvoke((Action)delegate
                     {
-                        foreach (var j in mostrar)
-                        {
-                            bool desejo = desejados.Contains(j.AppId) && !j.Meu;
-                            if (desejo) Aviso.Mostrar(j, L.Desejos, L.FraseDesejo(j), MostrarLista);
-                            else Aviso.Mostrar(j, L.T("NOVO NA BIBLIOTECA", "NEW IN YOUR LIBRARY"), null, MostrarLista);
-                        }
+                        foreach (var j in mostrar) Aviso.Mostrar(j, L.Novo, null, MostrarLista);
                         if (novos.Count > 5)
                             Aviso.Mostrar(new Jogo { AppId = "", Nome = "+" + (novos.Count - 4) + L.T(" outros jogos novos", " more new games"), Donos = "" },
-                                L.T("NOVO NA BIBLIOTECA", "NEW IN YOUR LIBRARY"), null, MostrarLista, L.T("Clique aqui para ver a lista", "Click here to see the list"));
+                                L.Novo, null, MostrarLista, L.T("Clique aqui para ver a lista", "Click here to see the list"));
                     });
                 }
             }
-            catch (SteamErro ex) { AvisarErro(ex); }
             catch (Exception ex)
             {
-                Programa.Log("Falha (internet ou Steam fora do ar), tento no proximo horario: " + ex.Message);
+                Programa.Log("Nao consegui ler os arquivos da Steam, tento no proximo horario: " + ex.Message);
             }
             finally { Interlocked.Exchange(ref ocupado, 0); }
-        }
+        });
     }
 
     void Sair()
@@ -579,7 +441,7 @@ class Aviso : Form
     static readonly List<Aviso> abertos = new List<Aviso>();
     static readonly Color Fundo1 = Color.FromArgb(0x2A, 0x3F, 0x5A), Fundo2 = Color.FromArgb(0x1B, 0x28, 0x38),
         Borda = Color.FromArgb(0x3D, 0x4C, 0x5E), Azul = Color.FromArgb(0x1A, 0x9F, 0xFF), AzulClaro = Color.FromArgb(0x66, 0xC0, 0xF4),
-        Cinza = Color.FromArgb(0x8F, 0x98, 0xA0), Verde = Color.FromArgb(0xA4, 0xD0, 0x07);
+        Cinza = Color.FromArgb(0x8F, 0x98, 0xA0);
 
     readonly Jogo jogo;
     readonly string cabecalho, frase, rodape;
@@ -639,8 +501,7 @@ class Aviso : Form
         g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
         using (var b = new System.Drawing.Drawing2D.LinearGradientBrush(ClientRectangle, Fundo1, Fundo2, 90f)) g.FillRectangle(b, ClientRectangle);
         using (var p = new Pen(Borda)) g.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
-        bool desejo = cabecalho == L.Desejos; // jogo da lista de desejos: verde de "compra" da Steam
-        using (var b = new SolidBrush(desejo ? Verde : Azul)) g.FillRectangle(b, 0, 0, (int)(3 * s), Height);
+        using (var b = new SolidBrush(Azul)) g.FillRectangle(b, 0, 0, (int)(3 * s), Height);
 
         int pad = (int)(12 * s), x = pad + (int)(3 * s), topo = pad;
         var fl = TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
@@ -666,7 +527,7 @@ class Aviso : Form
         using (var f3 = new Font("Segoe UI", 9f))
         {
             int y = base0 + (altura - (int)(54 * s)) / 2;
-            TextRenderer.DrawText(g, cabecalho, f1, new Rectangle(x, y, larg, (int)(15 * s)), desejo ? Verde : AzulClaro, fl);
+            TextRenderer.DrawText(g, cabecalho, f1, new Rectangle(x, y, larg, (int)(15 * s)), AzulClaro, fl);
             TextRenderer.DrawText(g, jogo.Nome, f2, new Rectangle(x, y + (int)(14 * s), larg, (int)(22 * s)), Color.White, fl);
             TextRenderer.DrawText(g, rodape, f3, new Rectangle(x, y + (int)(36 * s), larg, (int)(18 * s)), Cinza, fl);
         }
@@ -736,7 +597,7 @@ class JanelaLista : Form
         var rodape = new Label
         {
             Dock = DockStyle.Bottom, Height = 28, TextAlign = ContentAlignment.MiddleLeft,
-            Text = lista.Count == 0 ? L.T("  Ainda não li a biblioteca. Conecte a Steam pelo QR (botão direito no ícone perto do relógio).", "  Library not read yet. Connect Steam with the QR code (right-click the icon next to the clock).")
+            Text = lista.Count == 0 ? L.T("  Nenhum jogo instalado encontrado. A Steam está instalada neste PC?", "  No installed games found. Is Steam installed on this PC?")
                                     : L.T("  Clique no título de uma coluna para ordenar. O app confere sozinho a cada 2 horas (00h, 02h, 04h ... 22h).", "  Click a column title to sort. The app checks by itself every 2 hours (00:00, 02:00, 04:00 ... 22:00).")
         };
         Controls.Add(lv);
@@ -744,209 +605,6 @@ class JanelaLista : Form
         Controls.Add(dica);
         Controls.Add(rodape);
         Shown += delegate { busca.Focus(); };
-    }
-}
-
-// ---------------- sessao: o codigo de acesso vem do site da Steam, dentro do navegador do app ----------------
-static class Sessao
-{
-    public static readonly string PastaPerfil = Path.Combine(Programa.PastaDados, "navegador");
-    static string Marca { get { return Path.Combine(Programa.PastaDados, "conectado.txt"); } }
-    static string token;          // so na memoria; nunca vai para o disco
-    static DateTime vence;
-
-    public static bool Conectado { get { return File.Exists(Marca); } }
-
-    public static void Guardar(string t)
-    {
-        token = t;
-        vence = Steam.VenceToken(t);
-        File.WriteAllText(Marca, DateTime.Now.ToString("yyyy-MM-dd HH:mm"));
-    }
-
-    public static void Esquecer() { token = null; }
-
-    // Chamar na thread da tela. Reaproveita o token ate 10 min antes de vencer (~1 dia);
-    // depois abre o site da Steam escondido, com os cookies do navegador do app, como um navegador ja logado.
-    public static void ObterToken(Action<string> ok, Action<string, bool> falha)
-    {
-        if (token != null && DateTime.UtcNow < vence.AddMinutes(-10)) { ok(token); return; }
-        var j = new JanelaLogin(true);
-        j.Conectou += ok;
-        j.Falhou += falha;
-        j.Show();
-    }
-
-    public static void Desconectar()
-    {
-        token = null;
-        File.Delete(Marca);
-        try { Directory.Delete(PastaPerfil, true); } catch (Exception ex) { Programa.Log("Nao apaguei o navegador: " + ex.Message); }
-    }
-}
-
-// As bibliotecas do WebView2 (Microsoft) vao dentro do .exe e sao extraidas na primeira vez.
-static class Dlls
-{
-    public static readonly string Pasta = Path.Combine(Programa.PastaDados, "lib");
-    static readonly string[] Nomes = { "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll", "WebView2Loader.dll" };
-
-    public static void Preparar()
-    {
-        Directory.CreateDirectory(Pasta);
-        var asm = System.Reflection.Assembly.GetExecutingAssembly();
-        foreach (var n in Nomes)
-            using (var r = asm.GetManifestResourceStream(n))
-            {
-                string f = Path.Combine(Pasta, n);
-                if (File.Exists(f) && new FileInfo(f).Length == r.Length) continue;
-                using (var w = File.Create(f)) r.CopyTo(w);
-            }
-        AppDomain.CurrentDomain.AssemblyResolve += (s, e) =>
-        {
-            string f = Path.Combine(Pasta, new System.Reflection.AssemblyName(e.Name).Name + ".dll");
-            return File.Exists(f) ? System.Reflection.Assembly.LoadFrom(f) : null;
-        };
-    }
-}
-
-// Janela com o site oficial da Steam. oculto = renovar o codigo sem mostrar nada.
-// Regras: so abre sites https da Steam; sem pop-ups, ferramentas de desenvolvedor, menu, autopreenchimento
-// nem salvar senha; nunca le nem mexe na pagina de login. So le o texto da pagina
-// store.steampowered.com/pointssummary/ajaxgetasyncconfig, que entrega o "webapi_token" ao navegador logado.
-class JanelaLogin : Form
-{
-    public event Action<string> Conectou;
-    public event Action<string, bool> Falhou;
-    const string Config = "https://store.steampowered.com/pointssummary/ajaxgetasyncconfig";
-    static bool loaderPronto;
-    readonly WebView2 web = new WebView2 { Dock = DockStyle.Fill };
-    readonly bool oculto;
-    readonly string perfil;
-    bool lendo, terminou;
-    int tentativas;
-
-    public JanelaLogin(bool oculto, string perfil = null)
-    {
-        this.oculto = oculto;
-        this.perfil = perfil ?? Sessao.PastaPerfil;
-        Text = L.T("Entrar na Steam - ", "Sign in to Steam - ") + Programa.Nome;
-        if (oculto)
-        {
-            ShowInTaskbar = false; FormBorderStyle = FormBorderStyle.None; Opacity = 0;
-            StartPosition = FormStartPosition.Manual; Location = new Point(-3000, -3000); Size = new Size(800, 600);
-            var limite = new System.Windows.Forms.Timer { Interval = 90000 };
-            limite.Tick += delegate { limite.Stop(); Terminar(null, L.T("A Steam demorou demais para responder.", "Steam took too long to answer."), false); };
-            limite.Start();
-        }
-        else
-        {
-            StartPosition = FormStartPosition.CenterScreen; Size = new Size(560, 760);
-            Controls.Add(web);
-            Controls.Add(new Label
-            {
-                Dock = DockStyle.Top, Height = 70, Padding = new Padding(10, 8, 10, 0), Font = new Font("Segoe UI", 9.5f),
-                Text = L.T("Entre com a sua conta no site oficial da Steam, como em qualquer navegador. O Steam Snitcher não vê a sua senha: depois que você entrar, ele só lê o código de acesso que o site da Steam dá ao navegador.",
-                           "Sign in on Steam's official website, as in any browser. Steam Snitcher never sees your password: after you sign in, it only reads the access code Steam's website gives the browser.")
-            });
-        }
-        if (oculto) Controls.Add(web);
-        Load += async delegate { await Iniciar(); };
-        FormClosed += delegate { if (!terminou && !oculto) { terminou = true; if (Falhou != null) Falhou(L.T("Login cancelado.", "Sign-in cancelled."), false); } };
-    }
-
-    async Task Iniciar()
-    {
-        try
-        {
-            if (!loaderPronto) { CoreWebView2Environment.SetLoaderDllFolderPath(Dlls.Pasta); loaderPronto = true; }
-            var env = await CoreWebView2Environment.CreateAsync(null, perfil);
-            await web.EnsureCoreWebView2Async(env);
-        }
-        catch (Exception ex)
-        {
-            Programa.Log("WebView2: " + ex.Message);
-            if (!oculto) MessageBox.Show(L.T("Não consegui abrir o navegador do Windows (WebView2). Instale o \"Microsoft Edge WebView2 Runtime\" no site da Microsoft e tente de novo.\n\n",
-                                             "Could not open the Windows browser component (WebView2). Install the \"Microsoft Edge WebView2 Runtime\" from Microsoft's website and try again.\n\n") + ex.Message,
-                Programa.Nome, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            Terminar(null, "WebView2: " + ex.Message, false);
-            return;
-        }
-        var c = web.CoreWebView2;
-        var st = c.Settings;
-        st.AreDevToolsEnabled = false; st.AreDefaultContextMenusEnabled = false; st.IsStatusBarEnabled = false;
-        st.IsPasswordAutosaveEnabled = false; st.IsGeneralAutofillEnabled = false;
-        st.IsWebMessageEnabled = false; st.AreHostObjectsAllowed = false;
-        c.NewWindowRequested += (s, e) => { e.Handled = true; };              // sem pop-ups
-        c.NavigationStarting += (s, e) => { if (!SiteDaSteam(e.Uri)) e.Cancel = true; };
-        c.NavigationCompleted += async (s, e) => await Navegou(e.IsSuccess);
-        c.Navigate(oculto ? "https://store.steampowered.com/" : "https://store.steampowered.com/login/");
-    }
-
-    // escondida: nao rouba o foco (de um jogo em tela cheia, por exemplo) e nao aparece na barra de tarefas
-    protected override bool ShowWithoutActivation { get { return oculto; } }
-
-    protected override CreateParams CreateParams
-    {
-        get { var cp = base.CreateParams; if (oculto) cp.ExStyle |= 0x08000000 | 0x80; return cp; } // NOACTIVATE | TOOLWINDOW
-    }
-
-    static bool SiteDaSteam(string url)
-    {
-        Uri u;
-        if (!Uri.TryCreate(url, UriKind.Absolute, out u) || u.Scheme != "https") return false;
-        string h = u.Host.ToLowerInvariant();
-        return h == "steampowered.com" || h.EndsWith(".steampowered.com") || h == "steamcommunity.com" || h.EndsWith(".steamcommunity.com");
-    }
-
-    async Task Navegou(bool deuCerto)
-    {
-        if (terminou) return;
-        var u = web.Source;
-        if (lendo)
-        {
-            lendo = false;
-            string token = null;
-            try
-            {
-                var js = new JavaScriptSerializer();
-                string texto = js.Deserialize<string>(await web.CoreWebView2.ExecuteScriptAsync("document.body ? document.body.innerText : ''"));
-                var d = js.DeserializeObject(texto) as Dictionary<string, object>;
-                var dados = d != null && d.ContainsKey("data") ? d["data"] as Dictionary<string, object> : null;
-                token = dados != null && dados.ContainsKey("webapi_token") ? Convert.ToString(dados["webapi_token"]) : null;
-            }
-            catch (Exception ex) { Programa.Log("Nao li o codigo de acesso: " + ex.Message); }
-            if (!string.IsNullOrEmpty(token)) { Terminar(token, null, false); return; }
-            // sem codigo: a Steam ainda nao terminou de renovar o login, ou a pessoa saiu da conta
-            if (++tentativas < 3) { await Task.Delay(3000); if (!terminou) web.CoreWebView2.Navigate("https://store.steampowered.com/"); return; }
-            if (oculto) Terminar(null, L.T("A Steam pediu para você entrar de novo.", "Steam asked you to sign in again."), true);
-            else web.CoreWebView2.Navigate("https://store.steampowered.com/login/");
-            return;
-        }
-        if (!deuCerto)
-        {
-            if (oculto) Terminar(null, L.T("Sem internet, ou a Steam está fora do ar.", "No internet, or Steam is down."), false);
-            return; // na janela visivel a pessoa ve o erro e pode tentar de novo
-        }
-        if (perfil != Sessao.PastaPerfil) return; // demonstracao: so mostra a pagina
-        bool naLoja = u.Host == "store.steampowered.com" && !u.AbsolutePath.StartsWith("/login", StringComparison.OrdinalIgnoreCase);
-        if (naLoja) { lendo = true; web.CoreWebView2.Navigate(Config); }
-        else if (oculto && u.AbsolutePath.StartsWith("/login", StringComparison.OrdinalIgnoreCase))
-            Terminar(null, L.T("A Steam pediu para você entrar de novo.", "Steam asked you to sign in again."), true);
-    }
-
-    void Terminar(string token, string erro, bool precisaEntrar)
-    {
-        if (terminou) return;
-        terminou = true;
-        if (token != null)
-        {
-            Sessao.Guardar(token);
-            if (!oculto) Programa.Log("Entrou na Steam pelo site.");
-            if (Conectou != null) Conectou(token);
-        }
-        else if (Falhou != null) Falhou(erro, precisaEntrar);
-        BeginInvoke((Action)Close);
     }
 }
 
@@ -968,21 +626,19 @@ static class Demo
         var jogos = new List<Jogo>();
         for (int i = 0; i < d.GetLength(0); i++) jogos.Add(new Jogo { AppId = d[i, 0], Nome = d[i, 1], Donos = d[i, 2], Desde = d[i, 3] });
         Func<string, Jogo> achar = id => jogos.First(j => j.AppId == id);
-        var wukong = achar("2358720"); var hades = achar("1145360"); var hk = achar("367520");
-        foreach (var j in new[] { wukong, hades, hk }) j.BaixarCapa();
+        var wukong = achar("2358720"); var cyber = achar("1091500");
+        foreach (var j in new[] { wukong, cyber }) j.LerCapa(); // imagens do cache da Steam deste PC, se existirem
 
         var lista = new JanelaLista(jogos, busca);
         var icone = new NotifyIcon { Icon = SystemIcons.Information, Text = Programa.Nome + " (demo)", Visible = true };
         Action nada = delegate { };
-        icone.ContextMenuStrip = Bandeja.CriarMenu(nada, nada, nada, nada, delegate { lista.Close(); });
+        icone.ContextMenuStrip = Bandeja.CriarMenu(nada, nada, delegate { lista.Close(); });
         lista.FormClosed += delegate { icone.Visible = false; };
         lista.Shown += delegate
         {
             if (busca != null) return; // so a lista, para o print da busca
-            new JanelaLogin(false, Path.Combine(Path.GetTempPath(), "SteamSnitcherDemo")).Show(); // perfil vazio: nunca mostra a sua conta
-            Aviso.Mostrar(hk, L.T("EXEMPLO", "EXAMPLE"), L.T("É assim que vai aparecer o jogo novo adicionado na biblioteca", "This is how a new game added to your library will show up"), nada);
-            Aviso.Mostrar(hades, L.T("NOVO NA BIBLIOTECA", "NEW IN YOUR LIBRARY"), null, nada);
-            Aviso.Mostrar(wukong, L.Desejos, L.FraseDesejo(wukong), nada);
+            Aviso.Mostrar(cyber, L.T("EXEMPLO", "EXAMPLE"), L.Exemplo, nada);
+            Aviso.Mostrar(wukong, L.Novo, null, nada);
             var area = Screen.PrimaryScreen.WorkingArea;
             var t = new System.Windows.Forms.Timer { Interval = 2000 };
             t.Tick += delegate { t.Stop(); icone.ContextMenuStrip.Show(area.Right - 260, area.Bottom - 520); };
