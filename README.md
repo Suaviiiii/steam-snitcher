@@ -1,5 +1,8 @@
 # Steam Snitcher
 
+> [!CAUTION]
+> **Paused: please don't use the current version.** Connecting with the QR code made Steam flag the sign-in as a suspicious new device. Steam temporarily restricted the author's account ("This account may have been accessed by someone else"); it was not a ban. The download has been removed until the app can work without creating a new sign-in. If you already connected it: close the app, delete `%LOCALAPPDATA%\SteamSnitcher\conexao.dat`, remove **"PC - Steam Snitcher"** under **Steam → Account details → Authorized devices**, and contact [Steam Support](https://help.steampowered.com) if your account shows the same alert.
+
 **A tiny Windows app that rats out your Steam Family.** When a new game lands in your Steam library, Steam Snitcher tells you **which game it is and who bought it**. It also calls out the best case: *"Hey, Jordan bought Black Myth: Wukong from your wishlist!"*
 
 <p align="center"><img src="docs/screenshots/hero.png" alt="Steam Snitcher notifications" width="440"></p>
@@ -10,7 +13,6 @@
 - Runs quietly next to the clock and starts with Windows
 - Speaks Portuguese on Portuguese Windows and English everywhere else
 
-> **[⬇ Download SteamSnitcher.exe](https://github.com/Suaviiiii/steam-snitcher/releases/latest/download/SteamSnitcher.exe)**, double-click it, scan the QR code, done.
 
 ---
 
@@ -82,7 +84,7 @@ Right-click the icon next to the clock:
 
 ## Install
 
-1. Download **[SteamSnitcher.exe](https://github.com/Suaviiiii/steam-snitcher/releases/latest/download/SteamSnitcher.exe)** (also in the root of this repository).
+1. *(Download paused, see the warning at the top.)* Build `SteamSnitcher.exe` from source with `build.cmd`.
 2. Double-click it. The app isn't code-signed, so Windows SmartScreen may say *"Windows protected your PC"*. Click **More info → Run anyway**. If you'd rather not trust a binary, [build it yourself](#build-from-source): it takes one command.
 3. The file installs itself. It copies itself to `%LOCALAPPDATA%\Programs\SteamSnitcher`, adds a Start menu shortcut and sets itself to start with Windows. It doesn't need administrator rights.
 4. A window with a QR code opens. On your phone:
